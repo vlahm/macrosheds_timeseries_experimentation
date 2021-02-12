@@ -16,12 +16,15 @@ library(tidyverse)
 library(RcppRoll)
 library(lubridate)
 
+setwd('~/git/macrosheds/qa_experimentation/')
+
 knitr::opts_chunk$set(echo = TRUE, warning = F, message = F, 
                       comment = F)
 
-all_data <- read_csv('data/all_data.csv',
+all_data <- read_csv('data/anna_testdata.csv',
                col_types = c('Tnnncnnnin')) %>%
-  dplyr::filter(datetime < mdy_hms('10-06-2016 00:00:00'))
+    dplyr::filter(datetime < mdy_hms('10-06-2016 00:00:00')) %>%
+    select(-SC, -SC_filter) #what filter was used already?
 
 
 ```
@@ -30,50 +33,93 @@ all_data <- read_csv('data/all_data.csv',
 
 ## Butter from signal package
 
-Notes - Really strong performance in net removal of 1 us/cm jumps but preserves too much wiggle. 
+Notes - Really strong performance in net removal of 1 us/cm jumps but preserves too much wiggle.
+Also has head/tail artifacts that can't be addressed, it seems.
 
 ```{r}
 
 
 filtered <- all_data %>%
-  mutate(SC_noise = signal::filter(signal::butter(1,1/200,type='high'),
+  mutate(SC_butter_noise = signal::filter(signal::butter(1,1/200,type='high'),
                                     all_data$SC_filled) %>%
            as.numeric(),
-         SC_butter = SC_filled - SC_noise)
+         SC_butter = SC_filled - SC_butter_noise)
 
+
+all_xts <- xts(filtered %>%
+                 select(starts_with('SC')),
+               order.by=all_data$datetime)
+
+dygraph(all_xts)
 
 ```
 
 
-## TS decomposition
+## TS decomposition and STL
 
-Works very well, keeps some amount of noise, easier to understand
-maybe a signal filter on the denoised trend data? 
+Works very well, keeps some amount of noise, easier to understand.
+STL produces a smoother fit, but not an obviously better one:
+    peaks still cut off, 3
+butter filter after decomposition (either type) removes minute fluctuations, 
+    but creates the same characteristic "ramp-up" effect of butterworth alone.
+    in this case, that ramp up coincides for the most part with the 48 NAs left
+    by decomposition. if we just accept that we're going to have to reconstitute
+    the tails of our series, we lump the major failings of decomposition and
+    Butterworth filtering into one. Reconstitution by imputeTS::na_seasplit should be
+    pretty effective, since periodicity and trend will be the only signals remaining.
+    UPDATE: the ramp-up period is considerably longer than the sequence of NAs
+    at the beginning. so this doesn't work. even if the whole rampy part
+    is interpolated, it's wonkytron
+    
 
 ```{r}
 
+dts <- ts(all_data$SC_filled, deltat = 1/(24/(15/60)))
+decomp <- decompose(dts)
+stl_decomp <- stl(dts,
+                  s.window = 7, # must be odd; min 7
+                  s.degree = 0, # 0 or 1
+                  # t.window = ,
+                  t.degree = 1, #0 or 1
+                  # l.window = ,
+                  l.degree = 1,
+                  robust = FALSE)
 
-dts <- ts(filtered$SC_filled, deltat = 1/(24/(15/60)))
-d <- decompose(dts)
+flt_butter <- signal::butter(n = 1,
+                             W = 1/100,
+                             type = 'low')
 
+filtered <- all_data %>%
+  mutate(SC_decomp = as.numeric(decomp$trend),
+         SC_stl = as.numeric(stl_decomp$time.series[, 'trend']),
+         SC_decomp = imputeTS::na_interpolation(SC_decomp),
+         SC_stl = imputeTS::na_interpolation(SC_stl),
+         SC_decomp_butter = as.numeric(signal::filter(filt = flt_butter,
+                                                      x = SC_decomp)),
+         SC_stl_butter = as.numeric(signal::filter(filt = flt_butter,
+                                                   x = SC_stl)),
+         index = 1:nrow(.))
 
+#restore the NAs created by decomposition, and interpolate them
+nr <- nrow(filtered)
+filtered[c(1:48, (nr - 48):nr), c('SC_decomp_butter', 'SC_stl_butter')] <- NA
+           
+filtered <- filtered %>%
+    mutate(SC_decomp_butter = imputeTS::na_interpolation(SC_decomp_butter),
+           SC_stl_butter = imputeTS::na_interpolation(SC_stl_butter))
 
-dn <- as.numeric(d$trend)
-
-filtered_ts <- filtered %>%
-  dplyr::select(-SC,-SC_noise,-SC_filter) %>%
-  mutate(SC_decomp = dn) %>%
-  mutate(index = 1:nrow(.))
-
-all_xts <- xts(filtered_ts %>%
+all_xts <- xts(filtered %>%
                  select(starts_with('SC')),
-               order.by=all_data$datetime)
+               order.by = all_data$datetime)
 
 dygraph(all_xts)
 ```
 
 
 ## Loess
+
+pretty darned righteous. no unwanted bumps. no head/tail anomalies. hard to
+optimize (lots of parameters), but maybe search can be automated.
 
 ```{r}
 
@@ -89,6 +135,24 @@ dygraph(all_xts)
 ```
 
 
+## STL
+
+```{r}
+
+
+dts <- ts(all_data$SC_filled, deltat = 1/(24/(15/60)))
+
+         
+filtered_ts <- all_data %>%
+  mutate(SC_decomp = as.numeric(d$trend)) %>%
+  mutate(index = 1:nrow(.))
+
+all_xts <- xts(filtered_ts %>%
+                 select(starts_with('SC')),
+               order.by=all_data$datetime)
+
+dygraph(all_xts)
+```
 
 ## BAM
 
@@ -97,3 +161,96 @@ dygraph(all_xts)
 
 ```
 
+
+## other IIR filters from signal package 
+
+Chebyshev I, Kaiser, and Blackman filters have ripple effect. no good
+Spencer takes no parameters and returns garbage
+Savitzky-Golay takes a lot of parameters, but seems promising. doesn't have the
+    left-tail problem
+
+```{r}
+
+filtered <- all_data %>%
+    mutate(SC_sgolay = as.numeric(signal::sgolayfilt(x = SC_filled,
+                                                     p = 1,
+                                                     n = 31, #must be odd
+                                                     m = 0,
+                                                     ts = 1)),
+           SC_spencer = as.numeric(signal::spencer(x = SC_filled)))
+
+dygraph(xts(x = select(filtered,
+                       starts_with('SC')),
+            order.by = all_data$datetime))
+
+```
+
+## FIR filters from signal package
+
+all are are phase-shifted and still have left tail bogusness. there might be
+parameter combinations that address this, but I haven't found them. might
+be a way to optimize parameter search, but it would have to balance goodness
+of fit against complexity
+
+```{r}
+#FIR filters (order must be even for highpass and bandstop type)
+order <- 10
+cutoff <- 0.0001
+
+flt_hamming <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = hamming(order + 1))
+flt_hanning <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = hanning(order + 1))
+flt_bartlett <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = bartlett(order + 1))
+ftl_boxcar <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = boxcar(order + 1))
+ftl_triang <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = triang(order + 1))
+ftl_gausswin <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = gausswin(order + 1))
+ftl_blackman <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = blackman(order + 1))
+ftl_flattopwin <- signal::fir1(n = order,
+                    w = cutoff,
+                    type = 'low',
+                    window = flattopwin(order + 1))
+
+filtered <- all_data %>%
+    mutate(SC_hamming = as.numeric(signal::filter(filt = flt_hamming, x = SC_filled)),
+           SC_hanning = as.numeric(signal::filter(filt = flt_hanning, x = SC_filled)),
+           SC_bartlett = as.numeric(signal::filter(filt = flt_bartlett, x = SC_filled)),
+           SC_boxcar = as.numeric(signal::filter(filt = ftl_boxcar, x = SC_filled)),
+           SC_triang = as.numeric(signal::filter(filt = ftl_triang, x = SC_filled)),
+           SC_gausswin = as.numeric(signal::filter(filt = ftl_gausswin, x = SC_filled)),
+           SC_blackman = as.numeric(signal::filter(filt = ftl_blackman, x = SC_filled)),
+           SC_flattopwin = as.numeric(signal::filter(filt = ftl_flattopwin, x = SC_filled)))
+
+dygraph(xts(x = select(filtered,
+                       starts_with('SC')),
+            order.by = all_data$datetime))
+
+```
+
+
+## Super-beefy multi-pass approach
+
+
+```{r}
+
+
+```
