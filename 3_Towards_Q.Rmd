@@ -1,0 +1,612 @@
+---
+title: "3_Towards_Q"
+author: "Matthew Ross"
+date: "10/19/2020"
+output: 
+  html_document:
+  toc: true
+  toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(signal)
+library(lubridate)
+library(xts)
+library(dygraphs)
+library(RcppRoll)
+library(imputeTS)
+library(ggthemes)
+library(broom)
+library(tsibble)
+library(GGally)
+library(EGRET)
+library(imputeTS)
+
+raw_cm <- read_csv('data/stream/Stage_TS_19OCT20.csv') %>%
+  mutate(datetime = round_date(mdy_hm(datetime),'15 mins'))
+
+
+knitr::opts_chunk$set(echo = TRUE, cache = T, warning = FALSE,
+                      message = FALSE)
+```
+
+
+
+# Cleaning data
+
+## Cleaning pressure transducer time series. 
+
+### Identifying and cleaning during/after download times
+
+
+```{r}
+
+jumps <- raw_cm %>%
+  group_by(site) %>%
+  arrange(site,datetime) %>%
+  mutate(lag_event = lag(Event),
+         download = ifelse((Event - lag_event) >= 1 | is.na(lag_event), 0,1),
+         session = cumsum(download)) 
+
+#Make a dataframe of the first and last X # of measurements for each 
+#session. X is the # of measurements to average over. 
+
+
+
+jump_hunter <- function(df = jumps, x = 10){
+  last_x <- df %>%
+    group_by(site,session) %>%
+    # Get the last X obs per site and session
+    slice_tail(n = x) %>%
+    #Take median stage and lasttime recorded
+    summarize(last = median(stage,na.rm=T),
+              lasttime = max(datetime)) 
+  
+  #Same as above but for the first X slice of data
+  first_x <- jumps %>%
+    group_by(site,session) %>%
+    slice_head(n = x) %>%
+    summarize(first = median(stage,na.rm=T),
+              firsttime = min(datetime))
+  
+  #Join these datasets and find the median stage difference and the
+  #timediff. The time diff is critical because with big time gaps the 
+  # jumps are likely wrong. 
+  plunge <- inner_join(first_x,last_x) %>%
+    group_by(site) %>%
+    mutate(lead_first = lead(first,1,last[n()]),
+           event_jump =  last-lead_first,
+           #This took some thinking but it makes it so that the timeseries jumps backward 
+           # As desired. 
+           cume_jump = rev(cumsum(rev(event_jump))),
+           timediff = lasttime - lead(firsttime,1,lasttime[n()])) %>%
+    select(site,session,cume_jump,lasttime)
+  
+  
+  return(plunge)
+}
+
+
+
+plunger <- jump_hunter(jumps)
+
+
+
+
+## Nick suggsests loook at staff TS and subtract out based on staff gauge alone
+## Good idea!
+
+```
+
+### Example of applying jumps to Balas level data
+
+Notice how long time periods without data (in Mar 2019) are really problematic
+because we can't see how much the sensor vs. the river moved. 
+
+```{r}
+jumped <- jumps %>%
+    inner_join(jump_hunter(jumps)) %>%
+  #Varsovia shouldn't jump so removed jumps here 
+  #Attached to concrete channel in horizontal setting. 
+    mutate(cume_jump = ifelse(site == 'varsovia',0, cume_jump)) %>%
+    mutate(jumped_stage = stage - cume_jump)
+
+t.xts <- jumped %>%
+    ungroup() %>%
+    dplyr::filter(site == 'balas') %>%
+    dplyr::select(stage,jumped_stage,datetime) %>%
+    xts(. %>% select(-datetime),order.by=.$datetime)
+
+dygraph(t.xts) %>%
+  dyOptions(useDataTimezone = T)
+```
+
+
+
+
+### Field level vs. sensor level. 
+
+
+```{r}
+staff <- read_csv('data/stream/Staff_TS_19OCT20.csv') %>%
+  select(1:4) %>%
+  mutate(datetime = mdy_hm(paste(date,time))) %>%
+  dplyr::filter(!is.na(datetime)) %>%
+  mutate(datetime = round_date(datetime,'15 mins'))
+
+
+staff_sensor <- staff %>%
+  inner_join(jumped,by = c('site','datetime')) %>%
+  mutate(month = month(datetime))
+
+
+ggplot(staff_sensor,aes(x=staff_stage,y=jumped_stage,color = month)) + 
+  geom_point() + 
+  facet_wrap(~site,scales='free') + 
+  stat_smooth(method = 'lm') + 
+  scale_color_viridis_c()
+
+
+```
+
+IMHO it looks like all sites had an unrecorded jump in March, for missing 2 weeks
+of data. 
+
+This is quite problematic, because we don't know how much the sensors moved. And
+it could explain at least some of our uncertainty. Still, overall these data look
+promising except for varsovia.
+
+I'm just going to assume we can cut off our water year from April to April to deal with this jump. Going forward that's what will be reflected in our Q curves.
+
+If you want to change this...we need more data and I think one water year should be
+sufficient for your paper. (It was for all my mining papers!)
+
+### April 1 2019 - onward staff curves
+
+```{r}
+start_date = mdy_hms('04/01/2019 00:00:00')
+staff_sensor_april <- staff_sensor %>%
+  dplyr::filter(datetime > start_date)
+
+
+ggplot(staff_sensor_april,aes(x=staff_stage,y=jumped_stage,color = month)) + 
+  geom_point() + 
+  facet_wrap(~site,scales='free') + 
+  stat_smooth(method = 'lm') + 
+  scale_color_viridis_c() + 
+  xlab('Staff stage') + 
+  ylab('Sensor stage (jumped)')
+
+
+```
+
+
+
+## Sensor level to staff level conversions
+
+
+Now that we think our data is as clean as we can make it (at least programmatically). We will convert sensor level to staff level and 
+keep some metrics of uncertainty using sweet map and nesting functions. 
+
+```{r}
+
+
+
+#Apply the model to each site
+staff_conversion <- staff_sensor_april %>%
+  group_by(site) %>%
+  nest() %>%
+  mutate(mods = map(data,~lm(staff_stage ~ jumped_stage, data = .x)),
+         #Model summaries
+         mod_sum = map(mods,glance),
+         mod_tidy = map(mods,tidy))
+
+staff_summaries <- staff_conversion %>%
+  unnest(mod_sum) %>%
+  select(site,r.squared,p.value)
+
+knitr::kable(staff_summaries)
+
+```
+
+
+## Apply those models
+
+Really here we should be propagating uncertainty forward so we will use
+the predict function on our models and the full data and the 90percentile predictions
+
+
+```{r}
+
+my.predict <- function(mods,sensor_data){
+  out <- predict.lm(mods,sensor_data,interval='confidence')
+  return(tibble(med_staff = out[,1] %>% as.numeric(.),
+                min_staff = out[,2] %>% as.numeric(.),
+                max_staff = out[,3] %>% as.numeric(.)))
+}
+
+jumped_staff <- jumped %>%
+  group_by(site) %>%
+  nest() %>%
+  rename(sensor_data = data) %>%
+  inner_join(staff_conversion,by = 'site') %>%
+  mutate(preds = map2(mods,sensor_data,my.predict)) %>%
+  select(-mods,-mod_sum,-mod_tidy,-data) %>%
+  unnest(c(sensor_data,preds)) 
+
+
+```
+
+
+The output of those models is predictions where jumped stage is now converted to
+staff stage at the 0.05, 0.5, and 0.95 confidence intervals. It will give us a 
+sense of how uncertain our Q estimates are given our uncertainty in our staff 
+relationships
+
+
+
+# Q models with manual stage
+
+
+```{r}
+q <- read_csv('data/stream/Q_TS_19NOV20.csv')  %>%
+  mutate(manual_stage = manual_stage * 100)
+
+
+
+ggplot(q,aes(x=manual_stage,y=q)) + 
+  geom_point() + 
+  facet_wrap(~site, scales = 'free') 
+
+
+## Likely shapes
+functional_response <- tibble(site = c('balas','helado','raices','varsovia'),
+                              response = c('log','log',
+                                           'log','linear'))
+
+
+```
+
+##  Q models fits
+
+```{r}
+man_q <- function(df){
+  if(df$response[1] == 'log'){
+    mod <- lm(log(q) ~ manual_stage, data = df)
+  } else{
+    mod <- lm(q ~ manual_stage, data = df)
+  }
+}
+
+q_mods <- q %>%
+  inner_join(functional_response) %>%
+  group_by(site) %>%
+  nest() %>%
+  mutate(q_mods = map(data,man_q),
+                  #Model summaries
+         q_sum = map(q_mods,glance),
+         q_tidy = map(q_mods,tidy)) %>%
+    inner_join(functional_response) 
+
+
+
+q_summaries <- q_mods %>%
+  unnest(q_sum) %>%
+  select(site,r.squared,p.value,response)
+
+knitr::kable(q_summaries)
+
+
+```
+
+## Applying Q models
+
+```{r}
+q.predict <- function(mods,sensor_data){
+  out <- predict.lm(mods,sensor_data,interval='confidence')
+  return(tibble(med_q = out[,1] %>% as.numeric(.),
+                min_q = out[,2] %>% as.numeric(.),
+                max_q = out[,3] %>% as.numeric(.)))
+  
+}
+
+
+
+q_preds <- jumped_staff %>%
+  rename(manual_stage = med_staff) %>%
+  group_by(site) %>% 
+  nest() %>%
+  rename(sensor_data = data) %>%
+  inner_join(q_mods,by = 'site') %>%
+  mutate(preds = map2(q_mods,sensor_data,q.predict)) %>%
+  select(-q_mods,-q_sum,-q_tidy,-data) %>%
+  unnest(c(sensor_data,preds)) %>%
+  mutate(across(ends_with('_q'), ~ ifelse(response == 'log',exp(.),.))) %>%
+  dplyr::filter(datetime > mdy_hms('04/01/2019 00:00:00'),
+                across(ends_with('_q'), ~ . < 10)) %>%
+  mutate(date = as.Date(datetime)) 
+
+ggplot(q_preds,aes(x=med_q)) + 
+  geom_histogram() + 
+  facet_wrap(~site,scales='free')
+```
+
+
+# Discharge by site
+
+
+
+## Complete Q time
+
+Times where we have Q across all sites
+
+
+```{r}
+complete_dates <- q_preds %>%
+  group_by(date) %>%
+  summarize(count = n()) %>%
+  ungroup() %>%
+  dplyr::filter(count == max(count,na.rm = T)) %>%
+  pull(date)
+
+
+complete_q <- q_preds %>%
+  dplyr::filter(date %in% complete_dates) %>%
+  as_tsibble(.,key = site, index = datetime) %>%
+  fill_gaps(.)
+
+```
+
+## Complete q plot
+
+Times when we have Q everywhere
+```{r}
+
+ggplot(complete_q, aes(x = datetime, y = med_q)) + 
+    geom_ribbon(aes(ymax=max_q,ymin=min_q)) + 
+  facet_wrap(~site,scales= 'free_y') + 
+    geom_line(size = 1)  
+
+
+
+```
+
+
+# Q and nutes
+
+
+## Nutes vs nutes
+
+
+```{r}
+nutes <- read_csv('data/stream/tribs_averagednutrients.csv') %>%
+  mutate(site = tolower(location)) %>%
+  mutate(datetime = mdy_hms(paste(date,'12:00:00')),
+         date = as.Date(datetime),
+         tp = as.numeric(tp))
+
+
+ggpairs(nutes %>% dplyr::select(nh4_n:tdn)) + 
+  scale_x_log10() + 
+  scale_y_log10()
+```
+
+
+
+
+## Q vs Nutes -
+
+These all look chemostatic
+
+Chemostatic means we can't build models to go from Q and Temp to 15 min 
+predictions of concentration. At least not reliably. 
+
+
+```{r}
+q_daily <- q_preds %>%
+  inner_join(raw_cm %>% 
+               select(site,datetime,temp)) %>%
+  group_by(site,date) %>%
+  summarize(q = median(med_q),
+            count = n(),
+            temp = median(temp)) %>%
+  dplyr::filter(count > 4*20)
+
+q_nutes <- nutes %>% 
+  inner_join(q_daily,by = c('site','date')) %>%
+  select(-location,-count) %>%
+  pivot_longer(cols = nh4_n:tdn)
+  
+
+q_nutes %>%
+  ggplot(.,aes(x=q,y=value,color=temp)) + 
+  geom_point() + 
+  facet_grid(name~site,scales='free') +
+  scale_y_log10()
+
+
+```
+
+
+## Test models with Q and Temp. Will likely not be good
+
+```{r}
+
+nute_mod <- function(df){
+  mod <- lm(log(value) ~ q * temp,data=df)
+}
+
+
+nute_mods <- q_nutes %>%
+  group_by(site,name) %>%
+  nest() %>%
+  mutate(n_mods = map(data,nute_mod),
+        n_sum = map(n_mods,glance),
+         n_tidy = map(n_mods,tidy)) 
+
+
+nute_summaries <- nute_mods %>%
+  unnest(n_sum) %>%
+  select(site,r.squared,p.value)
+
+knitr::kable(nute_summaries)
+
+
+
+```
+
+
+
+```{r}
+
+daily_q <- complete_q %>%
+  as_tibble() %>%
+  group_by(date,site) %>%
+  summarize(q = mean(med_q,na.rm=T),
+            q_max = max(max_q),
+            q_min = min(min_q))
+
+
+
+```
+
+Those models are too bad to be useable
+
+So let's try EGRET wrtds method. Nope too complicatd see below. 
+
+
+## Likens method
+
+This is the most conservative method but our chemostatic behavior actually helps
+here. Here we will assume the concentration linearly drifts between samples and then just sum the concentrations using that assumption. It's the Gene Likens method from Hubbard Brook. This will be just with daily Q. 
+
+
+```{r,fig.height = 10, fig.width = 8}
+
+library(imputeTS)
+complete <- daily_q %>%
+  left_join(nutes %>% select(-location,-datetime)) %>%
+  group_by(site) %>%
+  mutate(interpolated = ifelse(is.na(doc),'Yes','No')) %>%
+  mutate(across(c('nh4_n','no3_n','tp','doc','tdn'),
+          ~na_interpolation(.))) %>%
+  arrange(site,date) %>%
+  dplyr::filter(date < ymd('2020-01-01'))
+
+
+complete_long <- complete %>%
+  pivot_longer(cols = nh4_n:tdn)
+
+ggplot(complete_long,aes(x=date,y=value,color=interpolated)) + 
+  geom_point(shape = 1) + 
+  facet_grid(name~site, scales = 'free_y') + 
+  ggthemes::theme_few() + 
+  scale_color_manual(values = c('red','black'))
+
+```
+
+
+## Fluxes
+
+I know it's dissapointed that we only have April - Jan, but the Q before April is just not reliable enough. So we can compare fluxes 
+from April to Jan
+
+
+
+```{r, fig.height = 10, fig.width = 8}
+fluxes <- complete_long %>%
+  #Convert Q from m3s to lpd
+  mutate(q_lpd = q*1000*60*60*24) %>%
+  #Convert nutes from mg/L to kg/l
+  mutate(kgl = value/(1000*1000)) %>%
+  #Convert to daily flux
+  mutate(kg_day = q_lpd*kgl)
+
+
+
+ggplot(fluxes,aes(x=date,y=kg_day,color=interpolated)) + 
+  geom_point(shape = 1) + 
+  facet_grid(name~site,scales='free') + 
+  ggthemes::theme_few() + 
+  scale_color_manual(values = c('red','black'))
+
+```
+
+
+
+
+```{r, eval = F}
+write_csv(complete_q,'data/stream/complete_q.csv')
+write_csv(daily_q, 'data/stream/daily_q.csv')
+write_csv(fluxes, 'data/stream/fluxes.csv')
+
+```
+
+## EGRET
+
+This is a fancy usgs method with confusing code. I never got it to work and can't work on this anymore. 
+
+
+```{r}
+
+sub_q <- complete_q %>%
+  as_tibble() %>%
+  dplyr::group_by(site,date) %>%
+  dplyr::summarize(Q = median(med_q,na.rm=T)) %>%
+  dplyr::filter(site == 'varsovia') %>%
+  ungroup() %>%
+  select(Date = date, Q = Q) %>%
+  mutate(LogQ = log(Q),
+         Julian = julian(Date),
+         Month = month(Date),
+         Day = yday(Date),
+         DecYear = year(Date),
+         MonthSeq = 1) %>%
+  dplyr::filter(!is.na(Date))
+
+
+
+samples <- q_nutes %>%
+  dplyr::filter(site == 'varsovia',
+                name == 'no3_n') %>%
+  rename(Date = date, ConcLow = value, Q = q) %>%
+  mutate(ConcHigh = ConcLow) %>%
+  select(-site,-temp,-name,-datetime) %>%
+  mutate(LogQ = log(Q),
+         Uncen = 1,
+         ConcAve = ConcHigh,
+         Julian = julian(Date),
+         Month = month(Date),
+         Day = yday(Date),
+         DecYear = year(Date),
+         MonthSeq = 1) %>%
+  dplyr::filter(!is.na(Date))
+
+
+INFO = tibble(param.units = 'mg',
+              shortName = 'dumb',
+              paramShortName = 'test',
+              constitAbbrev = 'constitAbbrev',
+              drainSqKm = 50)
+
+
+## This all doesn't work. 
+
+
+# my_test <- as.egret(INFO = INFO,
+#                 Daily = sub_q %>% as.data.frame(.),
+#                 Sample = samples %>% as.data.frame(.),
+#                 surfaces = NA) 
+# 
+# samples
+# 
+# out <- modelEstimation(eList = my_test,
+#                        minNumObs = 1,
+#                        minNumUncen = 1)
+# out
+
+```
+

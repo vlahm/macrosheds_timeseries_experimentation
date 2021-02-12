@@ -65,7 +65,7 @@ for(i in 1:n){
     # make the prediction of the rest of the data
     # this prediction is for assessing the model goodness-of-fit
     a2 = setdiff(1:nrow(x1), a)
-    x = x1[a2,2:7]
+    x = x1[a2,3:8]
     preds99[a2,i] = predict(model, newdata=x)
 
     # predict the solute concentration for each sensor measurment

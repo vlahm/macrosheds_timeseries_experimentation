@@ -1,0 +1,99 @@
+---
+title: "AK_TS_Cleaning"
+author: "Matthew Ross"
+date: "2/5/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+library(signal)
+library(xts)
+library(dygraphs)
+library(tidyverse)
+library(RcppRoll)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F, 
+                      comment = F)
+
+all_data <- read_csv('data/all_data.csv',
+               col_types = c('Tnnncnnnin')) %>%
+  dplyr::filter(datetime < mdy_hms('10-06-2016 00:00:00'))
+
+
+```
+
+
+
+## Butter from signal package
+
+Notes - Really strong performance in net removal of 1 us/cm jumps but preserves too much wiggle. 
+
+```{r}
+
+
+filtered <- all_data %>%
+  mutate(SC_noise = signal::filter(signal::butter(1,1/200,type='high'),
+                                    all_data$SC_filled) %>%
+           as.numeric(),
+         SC_butter = SC_filled - SC_noise)
+
+
+```
+
+
+## TS decomposition
+
+Works very well, keeps some amount of noise, easier to understand
+maybe a signal filter on the denoised trend data? 
+
+```{r}
+
+
+dts <- ts(filtered$SC_filled, deltat = 1/(24/(15/60)))
+d <- decompose(dts)
+
+
+
+dn <- as.numeric(d$trend)
+
+filtered_ts <- filtered %>%
+  dplyr::select(-SC,-SC_noise,-SC_filter) %>%
+  mutate(SC_decomp = dn) %>%
+  mutate(index = 1:nrow(.))
+
+all_xts <- xts(filtered_ts %>%
+                 select(starts_with('SC')),
+               order.by=all_data$datetime)
+
+dygraph(all_xts)
+```
+
+
+## Loess
+
+```{r}
+
+loess_mod <- loess(SC_filled ~ index, data = filtered_ts, span = 0.02)
+
+filtered_ts$SC_loess <- predict(loess_mod, newdata = filtered_ts)
+
+all_xts <- xts(filtered_ts %>%
+                 select(starts_with('SC')),
+               order.by=all_data$datetime)
+
+dygraph(all_xts)
+```
+
+
+
+## BAM
+
+```{r}
+
+
+```
+
