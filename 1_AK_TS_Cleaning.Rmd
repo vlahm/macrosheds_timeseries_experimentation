@@ -123,11 +123,11 @@ optimize (lots of parameters), but maybe search can be automated.
 
 ```{r}
 
-loess_mod <- loess(SC_filled ~ index, data = filtered_ts, span = 0.02)
+loess_mod <- loess(SC_filled ~ index, data = filtered, span = 0.02)
 
-filtered_ts$SC_loess <- predict(loess_mod, newdata = filtered_ts)
+filtered$SC_loess <- predict(loess_mod, newdata = filtered)
 
-all_xts <- xts(filtered_ts %>%
+all_xts <- xts(filtered %>%
                  select(starts_with('SC')),
                order.by=all_data$datetime)
 
@@ -143,11 +143,11 @@ dygraph(all_xts)
 dts <- ts(all_data$SC_filled, deltat = 1/(24/(15/60)))
 
          
-filtered_ts <- all_data %>%
+filtered <- all_data %>%
   mutate(SC_decomp = as.numeric(d$trend)) %>%
   mutate(index = 1:nrow(.))
 
-all_xts <- xts(filtered_ts %>%
+all_xts <- xts(filtered %>%
                  select(starts_with('SC')),
                order.by=all_data$datetime)
 
